@@ -66,7 +66,9 @@ const wsStore = useWSStore()
 const { isOffline, isOnline, isConnecting } = storeToRefs(wsStore)
 const { durationInMinutes } = storeToRefs(myStore)
 
-const issues = ref(0)
+// Derive the visible count directly from the store so a fast initial server
+// snapshot cannot arrive before the layout watcher is registered.
+const issues = computed(() => wsStore.wsMessage.alerts)
 const currentColorIndex = ref(0)
 const playingAudio = ref(false)
 const audio = new Audio(window.myAPI ? window.myAPI.audioFile : 'src/assets/audio/bells.wav')
@@ -87,7 +89,12 @@ let disposeLifecycleListeners = null
 //-----------------------------------------
 function playAudio() {
   audio.loop = true
-  audio.play()
+  // play() rejects if the media cannot start; surface it in the log instead of
+  // failing silently, because a missed sound is reported as a missed alert.
+  const started = audio.play()
+  if (started && typeof started.catch === 'function') {
+    started.catch((err) => console.error('[WS] alert sound failed to play', err))
+  }
   playingAudio.value = true
 }
 
@@ -189,8 +196,6 @@ watch(wsStore.wsMessage, (newValue) => {
     return
   }
 
-  issues.value = newValue.alerts
-
   if (newValue.notify) {
     stopColorSwitching()
     startColorSwitching()
@@ -208,7 +213,7 @@ watch(wsStore.wsMessage, (newValue) => {
   if (newValue.stopAlert === true) {
     stopAlerts()
   }
-})
+}, { immediate: true })
 
 watch(isOffline, (offline) => {
   if (!offline && wsStore.wsStatus === WebSocket.OPEN) {

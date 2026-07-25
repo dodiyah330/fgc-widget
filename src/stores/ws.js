@@ -5,18 +5,16 @@ import { acceptHMRUpdate, defineStore } from 'pinia'
 //const URL = 'ws://dev-fgc-incivisme.iboomobile.com:6018'
 const URL = 'ws://incivisme.fgc.cat:8080'
 
-/** Keep under common proxy/LB idle timeouts (~60–120s). */
-const HEARTBEAT_INTERVAL_MS = 25_000
-const HEARTBEAT_TIMEOUT_MS = 15_000
+const CONNECT_TIMEOUT_MS = 15_000
 const RECONNECT_BASE_MS = 2_000
 const RECONNECT_MAX_MS = 30_000
 
 /** Module-scoped timers (not Pinia state). */
-let heartbeatTimer = null
-let heartbeatTimeout = null
 let reconnectTimer = null
-let awaitingPong = false
+let connectTimeout = null
 let intentionalDisconnect = false
+let hasConnectedOnce = false
+let awaitingRecoverySnapshot = false
 
 function newWsMessage() {
   return { id: generateUuid(), alerts: 0, notify: false, stopAlert: false }
@@ -31,16 +29,11 @@ function logWs(level, message, detail) {
   }
 }
 
-function clearHeartbeat() {
-  if (heartbeatTimer) {
-    clearInterval(heartbeatTimer)
-    heartbeatTimer = null
+function clearConnectTimeout() {
+  if (connectTimeout) {
+    clearTimeout(connectTimeout)
+    connectTimeout = null
   }
-  if (heartbeatTimeout) {
-    clearTimeout(heartbeatTimeout)
-    heartbeatTimeout = null
-  }
-  awaitingPong = false
 }
 
 function clearReconnectTimer() {
@@ -71,60 +64,6 @@ export const useWSStore = defineStore('ws', {
     },
   },
   actions: {
-    _startHeartbeat() {
-      const $store = this
-      clearHeartbeat()
-
-      heartbeatTimer = setInterval(() => {
-        if ($store.wsStatus !== WebSocket.OPEN || !$store.ws) {
-          return
-        }
-
-        // Outbound traffic resets many proxy/LB idle timers even without a pong.
-        try {
-          $store.ws.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
-        } catch (err) {
-          logWs('error', 'heartbeat ping failed', err)
-          $store._handleDeadConnection('ping_send_failed')
-          return
-        }
-
-        awaitingPong = true
-        if (heartbeatTimeout) {
-          clearTimeout(heartbeatTimeout)
-        }
-        heartbeatTimeout = setTimeout(() => {
-          if (awaitingPong) {
-            // Soft warning only: server may not implement pong; ping still keeps proxies awake.
-            logWs('warn', 'heartbeat pong not received (server may not support pong)')
-            awaitingPong = false
-          }
-        }, HEARTBEAT_TIMEOUT_MS)
-      }, HEARTBEAT_INTERVAL_MS)
-    },
-
-    _handleDeadConnection(reason) {
-      logWs('warn', 'treating connection as dead', reason)
-      clearHeartbeat()
-      const socket = this.ws
-      this.ws = null
-      this.wsStatus = WebSocket.CLOSED
-      if (socket) {
-        try {
-          socket.onopen = null
-          socket.onclose = null
-          socket.onmessage = null
-          socket.onerror = null
-          socket.close()
-        } catch {
-          /* ignore */
-        }
-      }
-      if (!intentionalDisconnect) {
-        this._scheduleReconnect()
-      }
-    },
-
     _scheduleReconnect() {
       const $store = this
       if (intentionalDisconnect || reconnectTimer) {
@@ -147,10 +86,18 @@ export const useWSStore = defineStore('ws', {
     _applyAlertPayload(response) {
       const $store = this
       if (typeof response.alerts === 'number') {
+        const recoveredMissedAlerts =
+          awaitingRecoverySnapshot && response.alerts > $store.wsMessage.alerts
+        awaitingRecoverySnapshot = false
+
         $store.wsMessage.alerts = response.alerts
-        $store.wsMessage.notify = Boolean(response.notify)
+        $store.wsMessage.notify = Boolean(response.notify) || recoveredMissedAlerts
         $store.wsMessage.id = generateUuid()
         $store.wsMessage.stopAlert = false
+
+        if (recoveredMissedAlerts) {
+          logWs('warn', 'higher count recovered after reconnect', { alerts: response.alerts })
+        }
       }
     },
 
@@ -164,17 +111,11 @@ export const useWSStore = defineStore('ws', {
         return
       }
 
-      // Any inbound frame proves liveness.
-      awaitingPong = false
-      if (heartbeatTimeout) {
-        clearTimeout(heartbeatTimeout)
-        heartbeatTimeout = null
-      }
-
       const type = Object.hasOwnProperty.call(response, 'type') ? response.type : null
 
       if (type === 'ping') {
-        // Server may echo our ping or send its own; reply with pong.
+        // Optional application-level compatibility. Ratchet protocol ping/pong
+        // frames are handled automatically by Chromium and are not exposed here.
         if ($store.wsStatus === WebSocket.OPEN && $store.ws) {
           try {
             $store.ws.send(JSON.stringify({ type: 'pong', ts: Date.now() }))
@@ -211,22 +152,12 @@ export const useWSStore = defineStore('ws', {
       }
     },
 
-    requestSync() {
-      const $store = this
-      if ($store.wsStatus === WebSocket.OPEN && $store.ws) {
-        try {
-          $store.ws.send(JSON.stringify({ type: 'sync' }))
-          logWs('log', 'sync requested')
-        } catch (err) {
-          logWs('error', 'sync request failed', err)
-        }
-      }
-    },
-
     disconnect() {
       const $store = this
       intentionalDisconnect = true
-      clearHeartbeat()
+      hasConnectedOnce = false
+      awaitingRecoverySnapshot = false
+      clearConnectTimeout()
       clearReconnectTimer()
       $store.reconnectAttempt = 0
 
@@ -252,7 +183,7 @@ export const useWSStore = defineStore('ws', {
     forceReconnect(reason = 'force') {
       logWs('log', 'force reconnect', reason)
       intentionalDisconnect = false
-      clearHeartbeat()
+      clearConnectTimeout()
       clearReconnectTimer()
 
       const socket = this.ws
@@ -322,14 +253,29 @@ export const useWSStore = defineStore('ws', {
       $store.ws = ws
       logWs('log', 'connecting', URL)
 
+      connectTimeout = setTimeout(() => {
+        if ($store.ws === ws && $store.wsStatus === WebSocket.CONNECTING) {
+          logWs('warn', `connection attempt timed out after ${CONNECT_TIMEOUT_MS}ms`)
+          try {
+            ws.close()
+          } catch (err) {
+            logWs('error', 'failed to abort timed-out connection', err)
+            $store.ws = null
+            $store.wsStatus = WebSocket.CLOSED
+            $store._scheduleReconnect()
+          }
+        }
+      }, CONNECT_TIMEOUT_MS)
+
       ws.onopen = function (event) {
+        clearConnectTimeout()
         const openedAt = Date.now()
+        awaitingRecoverySnapshot = hasConnectedOnce
+        hasConnectedOnce = true
         $store.connectedAt = openedAt
         $store.wsStatus = event.target.readyState
         $store.reconnectAttempt = 0
         logWs('log', 'connection established', { url: URL, at: openedAt })
-        $store._startHeartbeat()
-        $store.requestSync()
       }
 
       ws.onclose = function (event) {
@@ -345,7 +291,7 @@ export const useWSStore = defineStore('ws', {
         $store.lastClose = info
         logWs('warn', 'connection closed', info)
 
-        clearHeartbeat()
+        clearConnectTimeout()
         if ($store.ws === ws) {
           $store.ws = null
         }

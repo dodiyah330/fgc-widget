@@ -1,194 +1,280 @@
-# FGC Desktop Widget – WebSocket Before & After Testing Report
+# FGC Desktop Widget – WebSocket Investigation and Before/After Report
 
-**Project:** FGC Incivility Desktop Widget (Electron)  
-**Prepared by:** Crest Coder Development Team  
-**Date:** 24 July 2026  
-**Endpoint tested:** `ws://incivisme.fgc.cat:8080`  
-**Build delivered:** `fgc-widget.app` / `fgc-widget_arm64.dmg` (macOS arm64)
+**Project:** FGC Incivility Desktop Widget
 
----
+**Prepared for:** FGC / Crest Coder Development Team
 
-## 1. Executive summary
+**Date:** 25 July 2026
+**Production WebSocket:** `ws://incivisme.fgc.cat:8080`
 
-The widget was experiencing intermittent WebSocket disconnects (reported ~every 2 minutes), delayed or missed alerts, and an inconsistent unread counter.
+## Executive summary
 
-**Root cause (client side):** The original widget had no keepalive/heartbeat, weak reconnection, no recovery after sleep/network change, incomplete disconnect logging, and no post-reconnect state sync. Quiet connections are vulnerable to proxy/load-balancer idle timeouts; any alert broadcast during a disconnect gap was lost until the next push, leaving the counter wrong.
+After receiving and reviewing both the Electron widget and Symfony WebSocket
+server code, we confirmed that the issue was not a proxy or load-balancer
+timeout. Production connects directly to ReactPHP/Ratchet, whose protocol-level
+keepalive sends a ping every 30 seconds.
 
-**What we delivered:** A hardened WebSocket client with 25-second keepalive pings, exponential-backoff reconnect, sleep/resume and network recovery, structured close-event logging, and sync-on-connect. A production macOS build was produced and validated with connection soak probes against the production WebSocket endpoint.
+The review identified multiple client and server defects that explain the wrong
+pending count, delayed recovery, false notification behavior, and potential
+whole-server disconnects:
 
-**Result of lab soak tests (after fix):** Continuous connection for 3+ minutes with heartbeat; **0 spontaneous disconnects** during the probe window. Longer on-site soak (2–4 hours) with CMS “test” alerts is recommended to confirm behaviour on the client’s network and workstations.
+1. The WebSocket count query did **not** use the same definition as the CMS
+   “Alertes pendents” list.
+2. A newly connected/reconnected widget could receive a stale count or no count.
+3. The server broadcast every application message type to every widget.
+4. A database exception in the periodic ReactPHP timer was not contained and
+   could terminate the long-running process.
+5. The widget had fragile fixed-delay reconnection, no sleep/wake recovery, and
+   insufficient close diagnostics.
+6. The widget UI could miss a very fast initial count due to a watcher race.
+7. The server polled for changes only every 14 seconds, making normal delivery
+   inherently delayed even while the connection was healthy.
 
----
+Both client and server patches have been prepared. The rebuilt widget passes
+lint and production build checks. A passive four-minute production WebSocket
+test completed with **zero spontaneous disconnects**.
 
-## 2. Reported issues (before)
+## Architecture confirmed by client
 
-| # | Issue (client report) | Frequency / impact |
-|---|------------------------|--------------------|
-| 1 | Widget disconnects | ~every 2 minutes |
-| 2 | Delayed notifications | Alerts not always immediate |
-| 3 | Lost notifications | Incidents during disconnect window may never appear |
-| 4 | Incorrect unread counter | Count drifts after disconnects |
-| 5 | Prior fixes unsuccessful | Problem present since original development; worse in production |
+- Production server listens directly on port `8080`.
+- No nginx/Apache proxy or load balancer is in the WebSocket path.
+- Server stack: ReactPHP `SocketServer` + Ratchet.
+- Ratchet protocol keepalive: 30 seconds.
+- Development WebSocket port: `6018`.
+- Widget log: `~/Library/Logs/FGC Widget APP/main.log`.
 
----
+## Before – confirmed technical findings
 
-## 3. Before – technical baseline
+### 1. Widget count did not match the CMS
 
-### 3.1 Behaviour
+The total displayed in CMS “Alertes pendents” is produced by
+`AlertRepository::getTotalAlerts()`, which counts alerts with pending state and
+excludes the `prova` test user.
 
-| Area | Before |
-|------|--------|
-| Keepalive / heartbeat | **None** – no ping/pong; socket idle when no alerts |
-| Reconnect | Fixed **5 second** single retry in UI layer |
-| Sleep / wake / network | **Not handled** – no Electron power/network recovery |
-| Close diagnostics | Log line only; **no** close code, reason, or session duration |
-| Error handling | Broken `onerror` path (`this.ws` / `close()` treated as Promise) |
-| Counter after reconnect | **No sync request**; relied only on next live broadcast |
-| Architecture risk | Idle proxy/LB timeout (~60–120s typical) can force periodic drops |
+The WebSocket query used a different definition. It did not exclude `prova`, and
+it additionally required:
 
-### 3.2 Why this caused the symptoms
+- `updatedAt IS NULL`
+- `fromCms IS NULL`
 
-```
-Connect → idle (no traffic) → intermediary/server closes socket (~2 min typical)
-         → 5s reconnect → alerts sent during the gap are missed
-         → unread counter stays stale until another broadcast arrives
-```
+Consequences:
 
-Production was reported worse than development (common when PROD has a different proxy/LB idle timeout).
+- An incident could remain visible in CMS “Alertes pendents” but disappear from
+  the widget count after being updated.
+- A pending incident created from the CMS could be excluded from the widget.
+- Pending alerts belonging to the `prova` user were counted by the widget but not
+  by the CMS total.
+- The mismatch was deterministic, not merely a temporary connection issue.
 
-### 3.3 Before – expected / observed operational behaviour
+### 2. Initial and reconnect count could be stale
 
-| Check | Before |
-|-------|--------|
-| Stable long-lived connection while idle | Unreliable (client-reported ~2 min drops) |
-| Automatic recovery after brief network blip | Slow / single fixed delay only |
-| Recovery after PC sleep | Unreliable |
-| Alert during short disconnect | Often lost |
-| Unread count vs CMS “Alertes pendents” | Can diverge after reconnect |
-| Diagnostic logs for disconnect RCA | Insufficient |
+The server stored a cached `lastCount` updated every 14 seconds. On connection:
 
----
+- no count was sent when the process had not completed its first timer cycle;
+- otherwise, the cached value could be up to 14 seconds old.
 
-## 4. After – changes implemented
+This explains delayed or temporarily incorrect counts after starting or
+reconnecting the widget.
 
-| Area | After |
-|------|--------|
-| Keepalive | Application **`ping` every 25 seconds** (keeps proxies awake) |
-| Reconnect | **Exponential backoff** (2s → max 30s), owned by WebSocket store |
-| Sleep / wake | Electron `powerMonitor` resume / unlock → forced reconnect |
-| Network | Browser `online` event → forced reconnect |
-| Close diagnostics | Logs **code, reason, wasClean, durationMs** (`[WS]` prefix → electron-log) |
-| Error handling | Corrected; wait for `onclose` for cleanup |
-| Counter recovery | **`sync` request on every successful connect**; server already pushes `{ alerts, notify }` on connect (verified) |
-| Logging volume | Routine ping noise reduced; disconnects and alert payloads retained |
+### 3. Application messages were broadcast globally
 
-### Protocol additions (widget → server)
+The server accepted any JSON object containing `type` and broadcast that type
+to all connected widgets.
 
-- `{ "type": "ping", "ts": <ms> }` — every ~25s  
-- `{ "type": "sync" }` — after each connect  
-- `{ "type": "pong", "ts": <ms> }` — if the server sends ping  
+This is unsafe because legacy widgets interpret any typed message other than
+`stop_alerts` as a notification. JSON `ping`, `pong`, `sync`, or unknown
+messages could therefore trigger false notification state across all widgets.
 
-Existing messages (`stop_alerts`, alert payloads) are unchanged.
+### 4. Timer/database errors could disconnect everyone
 
----
+The database query ran inside a ReactPHP periodic callback with no exception
+boundary. An exception escaping an event-loop timer can terminate the process,
+which disconnects all widgets simultaneously until the process is restarted.
 
-## 5. After – testing results
+### 5. Notification replay on count decrease
 
-### 5.1 Lab probes against production WebSocket
+Whenever the count changed and remained above zero, the server used
+`notify=true`. For example, handling one incident and reducing the count from
+five to four could replay sound/blinking even though no new incident arrived.
 
-| Test | Method | Duration | Result |
-|------|--------|----------|--------|
-| Soak **with** heartbeat | `scripts/ws-soak-probe.mjs` | 3 minutes | **1 open, 0 spontaneous closes**; session ~178s until intentional stop |
-| Idle control **without** heartbeat | `scripts/ws-idle-probe.mjs` | 3 minutes | Stayed open ~180s on this developer network path |
+### 6. Client recovery and state issues
 
-**Server behaviour observed during tests:**
+Before stabilization, the widget had:
 
-- On connect: pushes `{ "alerts": <n>, "notify": <bool> }` (authoritative snapshot — used for counter recovery).  
-- Echoes `{ "type": "ping" }` and `{ "type": "sync" }` (does not yet return a dedicated `pong` or sync body with alerts).  
-- Occasional `{ "type": "stop_alerts" }` from other channel activity.
+- a single fixed five-second reconnect timer in the Vue layout;
+- broken `onerror` cleanup;
+- no reconnect on computer sleep/wake or network restoration;
+- no WebSocket close code, reason, cleanliness, or session-duration logs;
+- a possible race where the server snapshot arrived before the UI watcher.
 
-**Note:** Exact ~2-minute idle kill was **not** reproduced from the lab network in a 3-minute window (network/proxy path dependent). Client hardening remains the correct mitigation for idle timeouts and for recovery when disconnects do occur. Longer soak on FGC workstations is the final production confirmation.
+### 7. Alert delivery had a built-in delay
 
-### 5.2 Build & quality
+The server checked the database every 14 seconds. A new incident could
+therefore take nearly 14 seconds to reach a correctly connected widget.
 
-| Check | Result |
-|-------|--------|
-| ESLint | Pass |
-| Production Electron build (macOS arm64) | **Success** |
-| Artifacts | `dist/electron/Packaged/mac-arm64/fgc-widget.app`, `fgc-widget_arm64.dmg`, `fgc-widget_arm64.pkg` |
+### 8. A connecting widget could silence other widgets
 
-### 5.3 Before vs after – comparison matrix
+The server compares each poll against a single shared `lastCount` baseline and
+only broadcasts when the value changes. Any code path that refreshes that
+baseline outside the broadcast therefore consumes the pending change.
 
-| Criterion | Before | After |
-|-----------|--------|-------|
-| Application heartbeat | No | Yes (25s) |
-| Reconnect strategy | Fixed 5s | Exponential backoff |
-| Sleep / network recovery | No | Yes |
-| Disconnect logging (code/reason/duration) | No | Yes |
-| Sync / snapshot after reconnect | No | Yes (connect push + sync request) |
-| Lab soak (3 min, with heartbeat) | N/A (legacy unstable by report) | **Stable – no spontaneous close** |
-| Lost alerts during brief gap | Likely | Mitigated by fast reconnect + connect snapshot |
-| Unread counter after reconnect | Often wrong | Restored from server connect payload |
+This was verified during our own review and is now covered by an automated
+regression test: if a widget connects (or requests a sync) between two polls,
+the shared baseline must not be updated, otherwise the next poll sees “no
+change” and the widgets already connected never receive the new incident.
 
----
+## After – corrections delivered
 
-## 6. Success criteria status
+### Server
 
-| Success criterion | Status |
-|-------------------|--------|
-| Stable WebSocket connection | **Improved** – keepalive + lab soak OK; confirm with on-site long soak |
-| Reliable automatic reconnection | **Implemented** |
-| Notifications without undue delay | **Improved** – fewer/shorter disconnect windows |
-| No lost notifications | **Mitigated** – reconnect + connect-time count; gaps still possible if server does not queue offline messages |
-| Accurate unread counter | **Improved** – restored on each connect from server snapshot |
-| No recurring ~2 min disconnects in extended testing | **Lab 3 min OK**; **client-site 2–4 hour soak still recommended** |
-| Stable in production environment | **Build ready**; deploy and validate on FGC machines |
+- Pending count now mirrors the CMS total exactly: pending state, excluding the
+  `prova` test user.
+- A fresh database count is sent immediately on every connect/reconnect.
+- Connect and sync responses no longer modify the shared broadcast baseline, so a
+  widget connecting between polls cannot suppress another widget's notification.
+- `sync` returns the current count only to the requester.
+- optional application `ping` returns `pong` only to the requester.
+- only `stop_alerts` is broadcast globally.
+- count increases use `notify=true`; decreases update with `notify=false`.
+- database/timer exceptions are logged and contained, allowing the next
+  two-second cycle to retry.
+- polling is reduced from 14 seconds to 2 seconds to bound normal delivery
+  delay.
+- a failed send is isolated to that client rather than breaking a full
+  broadcast.
+- Ratchet’s existing 30-second protocol keepalive remains enabled.
 
----
+### Widget
 
-## 7. Recommended on-site validation (FGC)
+- exponential reconnect backoff from 2 to 30 seconds;
+- 15-second connection-attempt timeout;
+- stale connection and reconnect timers are cleaned safely;
+- reconnect after Electron resume/unlock and browser network restoration;
+- close logs now include `code`, `reason`, `wasClean`, and `durationMs`;
+- broken `onerror` Promise/context logic removed;
+- visible incident count derives directly from Pinia state, eliminating the
+  initial-snapshot watcher race;
+- if the authoritative count is higher after a reconnect, the widget treats
+  the difference as incidents missed during the gap and triggers notification;
+- no JSON heartbeat is sent—the browser automatically answers Ratchet’s
+  protocol-level ping frames.
 
-Please run the new build on a machine that previously showed disconnects:
+## Before vs after
 
-1. Keep the widget running **2–4 hours**.  
-2. Confirm the UI does **not** repeatedly show “DESCONECTAT” every ~2 minutes.  
-3. From the mobile app, send alerts with description **`test`**.  
-4. Confirm widget count matches CMS **Alertes pendents**.  
-5. Sleep/wake the PC; confirm reconnection and correct count.  
-6. Delete only alerts whose description contains **`test`**.
+| Area | Before | After |
+|---|---|---|
+| Pending-count definition | Extra exclusions; could differ from CMS | Matches CMS pending state |
+| Count on connection | Cached, stale, or absent | Fresh authoritative database count |
+| Message routing | Every type broadcast globally | Explicit routing; only stop event global |
+| Count decrease | Could replay sound/blinking | Counter updates without notification |
+| Normal alert delay | Up to ~14 seconds by polling design | Up to ~2 seconds by polling design |
+| Timer query failure | Could escape event loop | Logged and contained |
+| Reconnection | Fixed 5-second UI timer | Exponential 2–30 second store-managed retry |
+| Connection attempt | No explicit timeout | 15-second timeout |
+| Sleep/network recovery | Not handled | Forced reconnect on resume/online |
+| Disconnect logs | Generic message only | Code, reason, cleanliness, duration |
+| Initial UI count | Watcher race possible | Direct reactive store value |
+| Incident during disconnect | Count could recover silently or stay stale | Higher reconnect snapshot triggers notification |
+| Heartbeat | Ratchet protocol ping already active | Preserved; no unsafe JSON ping traffic |
 
-Logs: electron-log path is printed at app startup (`Ruta de logs:`). Look for `[WS] connection closed` entries (code / reason / durationMs).
+## Testing completed
 
----
+### Production passive connection soak
 
-## 8. Remaining recommendations (server / infrastructure)
+The probe sent no JSON ping or sync traffic. It relied only on the same
+standards-based protocol keepalive used by Electron/Chromium.
 
-To complete permanent end-to-end hardening (Symfony/WebSocket source was not in the Widget package):
+| Run | Duration | Connections opened | Spontaneous disconnects | Longest session |
+| --- | --- | --- | --- | --- |
+| 1 | 4 minutes | 1 | 0 | 239,149 ms |
+| 2 | 20 minutes | 1 | 0 | 1,199,782 ms |
 
-1. Respond to `{ "type": "ping" }` with `{ "type": "pong" }`.  
-2. On `{ "type": "sync" }` (or every connect), always return `{ "alerts", "notify" }` with the current pending count.  
-3. Review proxy/LB idle timeouts for port `8080` (recommend idle timeout **well above** 25s; e.g. 60–300s).  
-4. Prefer **`wss://`** for production if TLS is available.
+- Initial server payload: `{"alerts":0,"notify":false}`
+- Final close in both runs: intentional, code `1000` (`probe_done`)
 
-A separate checklist of items still useful from the client team is available on request (`CLIENT_DELIVERABLES.txt`).
+Across 24 minutes of production connection time, both runs held a single
+uninterrupted session. Ten consecutive two-minute windows elapsed without a
+disconnect, so the reported "disconnects every two minutes" is not reproducible
+at the transport level from our network, and the 30-second protocol keepalive
+behaves correctly with a standard client.
 
----
+The practical consequence is that the reported symptoms are explained by the
+application-level defects above — an incorrect count definition, stale counts on
+connect, globally broadcast message types, suppressed increments and 14-second
+polling — rather than by a periodic transport timeout. On-site validation on a
+previously affected FGC workstation is still required, because we cannot observe
+that network from here.
 
-## 9. Deliverables package
+### Automated server smoke test
 
-| Item | Description |
-|------|-------------|
-| Stabilized widget source | Heartbeat, reconnect, sleep/network recovery, sync, logging |
-| Production macOS build | `.app` / `.dmg` / `.pkg` under `dist/electron/Packaged/` |
-| This report | Before / after testing summary for stakeholders |
-| Backend recommendations | Server & proxy alignment notes |
+Passed:
 
----
+- current count on open;
+- count filter identical to the CMS pending total;
+- private ping/pong;
+- private sync response;
+- global `stop_alerts`;
+- first cycle after restart publishes without replaying an alarm;
+- unchanged count is not rebroadcast;
+- notify on count increase, delivered to every connected widget;
+- no notify on count decrease;
+- a widget connecting between polls does not suppress the pending notification
+  for the widgets already connected;
+- a sync request between polls does not suppress the next broadcast;
+- database failure containment;
+- broadcasting continues after a client disconnects.
 
-## 10. Conclusion
+### Build and static checks
 
-**Before:** The widget relied on a fragile, idle WebSocket with minimal recovery — matching the reported ~2-minute disconnects, missed alerts, and wrong unread counts.
+- PHP syntax checks: **pass**
+- Server behavior smoke test: **pass**
+- Client WebSocket store smoke test: **pass**
+- Widget ESLint: **pass**
+- macOS arm64 Electron build: **pass**
 
-**After:** The widget actively keeps the connection alive, reconnects intelligently, recovers after sleep/network events, re-syncs the alert count on connect, and logs disconnects for diagnostics. Lab soak against production showed a stable multi-minute session with heartbeat.  
+Build artifacts (verification only, macOS arm64):
 
-**Next step for FGC:** Install the new build on a previously affected workstation, run the on-site checklist in section 7, and share logs if any disconnect cadence remains so proxy/server idle settings can be confirmed.
+- `dist/electron/Packaged/mac-arm64/fgc-widget.app`
+- `dist/electron/Packaged/fgc-widget_arm64.dmg`
+- `dist/electron/Packaged/fgc-widget_arm64.pkg`
+
+These artifacts are signed with a local *Apple Development* certificate and are
+not notarized, so `spctl` rejects them on other Macs. The distributable build
+must be produced on the release machine using the Informage Developer ID
+identity together with `APPLE_ID`, `APPLE_APP_SPECIFIC_PASSWORD` and
+`APPLE_TEAM_ID`, so that `src-electron/mac-config/notarize.js` notarizes it.
+Windows (`msi`) and Linux targets remain configured but were not built or tested
+in this engagement.
+
+## Deployment order
+
+1. Replace the Symfony files with:
+   - `server-patch/src/WebSocketServer.php`
+   - `server-patch/src/Command/WebSocketServerCommand.php`
+2. Restart the `app:websocket-server` production process.
+3. Install the rebuilt widget.
+4. Confirm the widget count equals the unfiltered CMS “Alertes pendents” total.
+
+## Required on-site acceptance test
+
+1. Run the widget for 2–4 hours on a workstation that previously reproduced
+   the issue.
+2. Send incidents whose description contains `test`.
+3. Verify each incident appears in the CMS and the widget count matches exactly.
+4. Manage/remove incidents and verify the count decreases without a new-alert
+   sound.
+5. Test sleep/wake and a temporary network interruption.
+6. Review `~/Library/Logs/FGC Widget APP/main.log` for any `[WS] connection
+   closed` entry.
+7. Delete only test incidents after validation.
+
+## Conclusion
+
+The server was not behind a proxy and its Ratchet keepalive was correctly
+enabled. However, server-side business logic and message routing defects were
+confirmed alongside client recovery defects.
+
+The delivered changes make the WebSocket count authoritative, prevent global
+message amplification, contain long-running server failures, improve automatic
+recovery, and provide actionable diagnostics. Final production acceptance
+requires deploying both patches and completing the on-site test above.

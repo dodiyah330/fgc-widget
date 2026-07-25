@@ -1,78 +1,82 @@
-FGC Widget – Backend / infrastructure findings & recommendations
-================================================================
-Date: 2026-07-24
-Status: Server source was NOT included in the Widget delivery.
-        Recommendations below are based on client behaviour + common
-        causes of ~2-minute WebSocket drops.
+FGC Widget – Confirmed server findings and deployment notes
+============================================================
+Date: 2026-07-25
+Endpoint: ws://incivisme.fgc.cat:8080
+Server: ReactPHP SocketServer + Ratchet v0.4.4 (direct, no proxy/LB)
 
-1. Observed client protocol (current widget)
--------------------------------------------
-URL:  ws://incivisme.fgc.cat:8080  (plain WS, not WSS)
+CONFIRMED ROOT CAUSES
+---------------------
+1. WebSocket count did not match the CMS definition.
+   The total shown in "Alertes pendents" comes from
+   AlertRepository::getTotalAlerts(): state = pending AND user != 'prova'.
+   WebSocketServer.php did not exclude 'prova' and additionally excluded
+   updatedAt IS NOT NULL and fromCms IS NOT NULL records. Therefore, an edited
+   pending alert or one created from the CMS could appear in "Alertes pendents"
+   but be absent from the widget count, while pending 'prova' alerts were
+   counted by the widget and not by the CMS.
 
-Inbound (server → widget):
-  { "alerts": <number>, "notify": <boolean> }
-  { "type": "stop_alerts" }
+2. Initial/reconnect count could be stale or missing.
+   onOpen returned cached lastCount only. Before the first 14-second timer it
+   sent nothing; afterward the value could be up to 14 seconds old.
 
-Outbound (widget → server):
-  { "type": "stop_alerts" }
-  { "type": "ping", "ts": <ms> }     NEW – every ~25s (keepalive)
-  { "type": "sync" }                 NEW – on each successful connect
-  { "type": "pong", "ts": <ms> }     NEW – if server sends ping
+3. Every application message was broadcast to every widget.
+   ping, pong, sync, unknown message types, and stop_alerts were all global.
+   Legacy clients interpret any typed message other than stop_alerts as a
+   notification, so JSON heartbeat/sync traffic can create false alerts.
 
-2. Root-cause hypothesis (high confidence)
-------------------------------------------
-There is no 120s timeout in the Electron client. Disconnects every
-~2 minutes with no application heartbeat historically match:
+4. Timer/database exceptions were not contained.
+   An exception escaping the ReactPHP periodic callback can terminate the
+   long-running WebSocket process and disconnect all clients.
 
-  - Reverse proxy / load balancer idle timeout (~120s)
-  - Or a server-side idle close with no ping/pong
+5. Any count change replayed notification behavior while count > 0.
+   A decrease from 5 to 4 still used notify=true, causing unnecessary
+   sound/blinking.
 
-Because the old client sent zero traffic while idle, any intermediary
-with a 120s idle timer would close the socket on a fixed cadence.
-Production failing more often than DEV usually means different proxy
-timeouts or an extra LB hop in PROD.
+6. Normal delivery was delayed by design.
+   The server queried for new incidents only every 14 seconds, so even a stable
+   connection could not receive a new count immediately.
 
-3. Required server-side support (please implement)
--------------------------------------------------
-A. Prefer answering application ping:
-     receive { "type": "ping" } → send { "type": "pong" }
+7. The shared broadcast baseline could be consumed by a connecting widget.
+   Broadcasts are only emitted when the polled count differs from lastCount. Any
+   path that refreshes lastCount outside broadcastAlerts() makes the next poll
+   see "no change", so a widget connecting or syncing between two polls silences
+   the new incident for every widget already connected.
 
-B. On { "type": "sync" } (or on every new connection), push current
-   pending count so the widget can recover after a gap:
-     { "alerts": <pendingCount>, "notify": <bool> }
-   (Same shape as existing alert broadcasts.)
+WHAT THE PATCH CHANGES
+----------------------
+- Count query now mirrors the CMS total: state = 1 AND user != 'prova'.
+- Every connection receives a fresh authoritative count immediately.
+- onOpen/sync never modify lastCount, so they cannot suppress a broadcast.
+- sync returns a fresh count only to its requester.
+- application ping returns pong only to its requester.
+- only stop_alerts is broadcast globally.
+- notify=true only when the pending count increases.
+- polling interval reduced from 14 seconds to 2 seconds.
+- timer/query failures are logged and contained; the next cycle retries.
+- failed client sends are isolated and the bad connection is closed.
 
-C. Confirm broadcasts only reach currently connected sockets.
-   Alerts emitted while a widget is disconnected are lost unless
-   the next connect/sync returns the authoritative count (B).
+KEEPALIVE CONCLUSION
+--------------------
+The client was correct that protocol keepalive already exists:
 
-D. Idle / proxy timeouts:
-   - nginx: proxy_read_timeout / proxy_send_timeout ≥ 300s (or disable
-     idle close for the WS location); enable websocket Upgrade headers
-   - AWS ALB etc.: idle timeout > heartbeat interval (25s); recommend ≥ 60–300s
-   - Raise any app-level connection idle timeout above the heartbeat
+  $wsServer->enableKeepAlive($loop, 30)
 
-E. Prefer wss:// behind TLS termination for production.
+Ratchet sends WebSocket control-frame pings. Chromium/Electron answers pong
+control frames automatically. No JSON/application heartbeat is needed. The
+widget's temporary JSON ping was removed because the old server rebroadcast
+it globally.
 
-4. Until server source is provided
----------------------------------
-The widget now:
-  - Sends ping every 25s (often enough to reset proxy idle timers)
-  - Reconnects with exponential backoff
-  - Requests sync on open
-  - Logs close code / reason / durationMs for RCA from electron-log
-  - Reconnects on OS resume / browser online
+DEPLOYMENT
+----------
+1. Replace:
+   - src/WebSocketServer.php
+   - src/Command/WebSocketServerCommand.php (unchanged behavior; included)
+2. Restart the app:websocket-server process.
+3. Deploy the rebuilt widget.
+4. Confirm widget count equals the unfiltered CMS "Alertes pendents" total.
+   Note: the polling interval constant POLL_INTERVAL_SECONDS is now 2. This runs
+   one indexed COUNT query every 2 seconds; raise it if DB load is a concern.
+5. Monitor server logs for "Error consultando alertas" and client logs for
+   "[WS] connection closed" (code/reason/durationMs).
 
-Probe notes (2026-07-24 against prod):
-  - With heartbeat: 3 min continuous session, no spontaneous close
-  - Idle 3 min from this network also stayed up (path-dependent)
-  - Server echoes {type:"ping"} and {type:"sync"} without pong/alerts body
-  - Server DOES push {alerts,notify} immediately on connect (used for resync)
-
-If disconnects continue at exactly ~120s AFTER this client ship on the
-client's site, inspect proxy/LB idle timeout (item D) and electron-log
-close events (code/reason/durationMs).
-
-5. Deliverables still needed from client
----------------------------------------
-See CLIENT_DELIVERABLES.txt in this repository.
+Patch files are under server-patch/ in the Widget repository.

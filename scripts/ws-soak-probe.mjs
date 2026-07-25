@@ -3,11 +3,11 @@
  * Soak / reconnect probe against the production WebSocket (Node built-in WebSocket).
  * Usage: node scripts/ws-soak-probe.mjs [durationMinutes=3]
  *
- * Mirrors the widget keepalive (ping every 25s) and records close cadence.
+ * Remains passive like the widget. Ratchet sends protocol-level ping frames;
+ * Node/Chromium answer protocol pong frames automatically.
  */
 const URL = process.env.WS_URL || 'ws://incivisme.fgc.cat:8080'
 const DURATION_MIN = Number(process.argv[2] || 3)
-const HEARTBEAT_MS = 25_000
 const endAt = Date.now() + DURATION_MIN * 60_000
 
 const closes = []
@@ -15,20 +15,12 @@ let opens = 0
 let messages = 0
 let intentional = false
 let socket = null
-let heartbeat = null
 let reconnectTimer = null
 let connectedAt = null
 let attempt = 0
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args)
-}
-
-function clearHeartbeat() {
-  if (heartbeat) {
-    clearInterval(heartbeat)
-    heartbeat = null
-  }
 }
 
 function connect() {
@@ -41,14 +33,6 @@ function connect() {
     connectedAt = Date.now()
     attempt = 0
     log('OPEN')
-    socket.send(JSON.stringify({ type: 'sync' }))
-    clearHeartbeat()
-    heartbeat = setInterval(() => {
-      if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'ping', ts: Date.now() }))
-        log('ping')
-      }
-    }, HEARTBEAT_MS)
   })
 
   socket.addEventListener('message', (event) => {
@@ -63,11 +47,11 @@ function connect() {
       reason: event.reason || '',
       wasClean: event.wasClean,
       durationMs,
+      intentional,
       at: new Date().toISOString(),
     }
     closes.push(entry)
     log('CLOSE', entry)
-    clearHeartbeat()
     connectedAt = null
     socket = null
     if (!intentional && Date.now() < endAt) {
@@ -88,13 +72,13 @@ const watch = setInterval(() => {
   if (Date.now() >= endAt) {
     intentional = true
     clearInterval(watch)
-    clearHeartbeat()
     if (reconnectTimer) clearTimeout(reconnectTimer)
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.close(1000, 'probe_done')
     }
     setTimeout(() => {
       const durations = closes.map((c) => c.durationMs).filter((d) => d != null)
+      const spontaneousCloses = closes.filter((c) => !c.intentional)
       const avg =
         durations.length > 0
           ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length)
@@ -102,7 +86,7 @@ const watch = setInterval(() => {
       log('SUMMARY', {
         durationMin: DURATION_MIN,
         opens,
-        closes: closes.length,
+        spontaneousCloses: spontaneousCloses.length,
         messages,
         avgSessionMs: avg,
         closeDurationsMs: durations,

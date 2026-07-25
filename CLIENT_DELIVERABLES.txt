@@ -1,32 +1,33 @@
-FGC Widget – Items still required from client (for full RCA / Phase 3)
-=====================================================================
-Please forward this list to the FGC / Incivility CMS team.
+FGC Widget – Client inputs received / remaining actions
+=======================================================
+Updated: 2026-07-25
 
-1. WebSocket / Symfony server source
-   - The WebSocket server file(s) previously mentioned as shared separately.
-   - Not present in the production Widget package we received.
+RECEIVED
+--------
+- Symfony WebSocket source:
+  src/WebSocketServer.php
+  src/Command/WebSocketServerCommand.php
+- Production architecture:
+  direct ReactPHP SocketServer on port 8080; no proxy/load balancer.
+- Keepalive:
+  Ratchet protocol ping every 30 seconds.
+- Production endpoint:
+  ws://incivisme.fgc.cat:8080
+- Development environment:
+  dev-fgc-incivisme.iboomobile.com, WebSocket port 6018.
+- Permission to test directly against production.
+- Widget log path:
+  ~/Library/Logs/FGC Widget APP/main.log
 
-2. Production exposure of WebSocket (port 8080)
-   - nginx / Apache / load-balancer config for ws://incivisme.fgc.cat:8080
-   - Idle / proxy_read / LB timeout values
-   - Whether TLS (wss://) is available or planned
+REMAINING CLIENT-SIDE ACTIONS
+-----------------------------
+1. Deploy the two corrected Symfony files from server-patch/ and restart the
+   app:websocket-server process.
+2. Install the rebuilt widget on a workstation that previously reproduced the
+   issue.
+3. Run a 2–4 hour production validation with test alerts.
+4. Confirm the widget number exactly matches CMS "Alertes pendents".
+5. If a disconnect remains, send the matching server log and
+   ~/Library/Logs/FGC Widget APP/main.log window.
 
-3. Sample widget logs from a machine that reproduces disconnects
-   - electron-log path is printed at app startup ("Ruta de logs:")
-   - Prefer a stretch covering several ~2-minute disconnect cycles
-
-4. Pending-alerts count API (if any)
-   - REST or other HTTP endpoint returning current unread / pending alert count
-   - Used by the widget to resync after reconnect (in addition to live WS pushes)
-
-5. Environment confirmation
-   - Official DEV vs PROD WebSocket URLs
-   - Permission to run long soak tests against production WS endpoint
-
-Nice-to-have:
-   - Server process logs around disconnect windows
-   - Notes on prior attempted fixes that did not resolve the issue
-
-Client widget work (heartbeat, reconnect, sleep/resume, close-code logging,
-post-reconnect sync request) proceeds without these; server/proxy confirmation
-and permanent infra alignment require items 1–2.
+No additional source/configuration is currently required for the code fix.
