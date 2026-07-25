@@ -1,0 +1,96 @@
+// app global css in SCSS form
+.radio-box {
+  width: 18px;
+  height: 18px;
+  background: #ffffff99;
+  cursor: pointer;
+  display: flex;
+  justify-content: center;
+  align-items: center; /* Center content inside the div */
+  border-radius: 50%;
+  position: relative;
+
+  &.selected {
+    background-color: $dark; /* Black background when selected */
+
+    .inner-circle {
+      display: block;
+      background-color: white; /* White background */
+    }
+  }
+
+  .inner-circle {
+    display: none;
+    position: absolute;
+    width: 6px; /* Circle width */
+    height: 6px; /* Circle height (same as width) */
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    border-radius: 50%; /* Fully rounded corners to make it a circle */
+  }
+}
+
+.main-box {
+  border-radius: 20px;
+  box-shadow: 2px 2px 4px rgba(0, 0, 0, 0.2);
+  width: 215px;
+  height: 140px;
+  //padding: 10px 9.13px 8.38px 9px;
+  gap: 0;
+  position: relative;
+
+  .issue-num {
+    text-align: center;
+    font-weight: 600;
+    font-size: 3em;
+    line-height: 22px;
+    color: $dark;
+    text-underline-position: from-font;
+    text-decoration-skip-ink: none;
+  }
+
+  .issue-text {
+    font-style: normal;
+    font-weight: 800;
+    font-size: 20px;
+    line-height: 20px;
+    margin: 13px;
+    text-align: center;
+    color: $dark;
+  }
+
+}
+
+.q-ma-xss {
+  margin: 4px;
+}
+
+.bg-alert-off {
+  background-color: $dark;
+
+  div {
+    color: white !important;
+  }
+  .issue-num {
+    font-weight: 600;
+  }
+  .selectable-value {
+    color: #ffffff99 !important;
+  }
+  .selectable-container {
+    background: #f2f2f233 !important;
+  }
+
+  .radio-box.selected .inner-circle {
+    background-color: $negative;
+  }
+
+  .radio-box.selected {
+    background: $positive;
+  }
+}
+
+.bg-alert-on {
+  background-color: $positive;
+}

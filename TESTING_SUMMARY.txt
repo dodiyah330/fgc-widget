@@ -1,0 +1,62 @@
+FGC Widget – WebSocket testing summary
+======================================
+Date: 2026-07-24
+Endpoint: ws://incivisme.fgc.cat:8080
+
+1. Soak with heartbeat (scripts/ws-soak-probe.mjs, 3 min)
+---------------------------------------------------------
+- Opens: 1
+- Spontaneous closes: 0 (only intentional probe_done)
+- Session duration: ~178s continuous
+- Server behaviour observed:
+  - On connect: pushes {"alerts":0,"notify":false}
+  - Echoes {"type":"sync"} for sync request (does NOT include alerts)
+  - Echoes {"type":"ping"} for ping (does NOT send {"type":"pong"})
+  - Occasional {"type":"stop_alerts"} from other activity on the channel
+
+2. Idle control WITHOUT heartbeat (scripts/ws-idle-probe.mjs, 3 min)
+--------------------------------------------------------------------
+- Session stayed open ~180s with no client traffic after the initial snapshot
+- No spontaneous close in this window from this network path
+
+Interpretation:
+- From this developer network, a hard ~120s idle kill was NOT reproduced in 3 minutes.
+- Client still lacked heartbeat/resync/sleep handling; production paths (proxy, Windows,
+  sleep) can differ. Heartbeat every 25s is the correct permanent mitigation for idle
+  proxy timeouts and is now shipped in the widget.
+- Authoritative counter recovery on reconnect relies on the server's existing
+  connect-time {"alerts","notify"} push (verified). A richer sync response that
+  includes alerts is still recommended (see BACKEND_RECOMMENDATIONS.txt).
+
+3. Client changes validated by lint
+-----------------------------------
+- src/stores/ws.js – heartbeat, backoff reconnect, close-code logging, sync, fixed onerror
+- src/layouts/MainLayout.vue – reconnect owned by store; power/online listeners
+- src-electron/electron-main.js – powerMonitor resume/unlock → IPC
+- src-electron/electron-preload.js – onPowerResume / onNetworkChange
+
+4. Suggested longer validation on client site
+---------------------------------------------
+- Run widget 2–4 hours, confirm no recurring disconnect cadence
+- Create CMS alerts with description "test"; match widget count to Alertes pendents
+- Sleep/wake the machine; confirm auto-reconnect and counter
+- Delete only "test" alerts afterward
+
+5. Production build artifacts
+-----------------------------
+Build succeeded (notarization skipped without Apple credentials).
+
+  App:  dist/electron/Packaged/mac-arm64/fgc-widget.app
+  DMG:  dist/electron/Packaged/fgc-widget_arm64.dmg
+  PKG:  dist/electron/Packaged/fgc-widget_arm64.pkg
+
+6. Code changes
+---------------
+- src/stores/ws.js – heartbeat (25s ping), exponential reconnect, close code/reason/
+  duration logging, sync on open, fixed onerror, forceReconnect
+- src/layouts/MainLayout.vue – reconnect moved to store; online/power resume hooks
+- src-electron/electron-main.js – powerMonitor resume/unlock → IPC to renderer
+- src-electron/electron-preload.js – onPowerResume / onNetworkChange bridges
+- src-electron/mac-config/notarize.js – skip notarize when Apple env vars missing
+- scripts/ws-soak-probe.mjs, scripts/ws-idle-probe.mjs – RCA probes
+- CLIENT_DELIVERABLES.txt, BACKEND_RECOMMENDATIONS.txt, TESTING_SUMMARY.txt

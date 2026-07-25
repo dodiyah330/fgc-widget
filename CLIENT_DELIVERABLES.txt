@@ -1,0 +1,32 @@
+FGC Widget – Items still required from client (for full RCA / Phase 3)
+=====================================================================
+Please forward this list to the FGC / Incivility CMS team.
+
+1. WebSocket / Symfony server source
+   - The WebSocket server file(s) previously mentioned as shared separately.
+   - Not present in the production Widget package we received.
+
+2. Production exposure of WebSocket (port 8080)
+   - nginx / Apache / load-balancer config for ws://incivisme.fgc.cat:8080
+   - Idle / proxy_read / LB timeout values
+   - Whether TLS (wss://) is available or planned
+
+3. Sample widget logs from a machine that reproduces disconnects
+   - electron-log path is printed at app startup ("Ruta de logs:")
+   - Prefer a stretch covering several ~2-minute disconnect cycles
+
+4. Pending-alerts count API (if any)
+   - REST or other HTTP endpoint returning current unread / pending alert count
+   - Used by the widget to resync after reconnect (in addition to live WS pushes)
+
+5. Environment confirmation
+   - Official DEV vs PROD WebSocket URLs
+   - Permission to run long soak tests against production WS endpoint
+
+Nice-to-have:
+   - Server process logs around disconnect windows
+   - Notes on prior attempted fixes that did not resolve the issue
+
+Client widget work (heartbeat, reconnect, sleep/resume, close-code logging,
+post-reconnect sync request) proceeds without these; server/proxy confirmation
+and permanent infra alignment require items 1–2.

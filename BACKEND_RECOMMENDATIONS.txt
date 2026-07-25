@@ -1,0 +1,78 @@
+FGC Widget – Backend / infrastructure findings & recommendations
+================================================================
+Date: 2026-07-24
+Status: Server source was NOT included in the Widget delivery.
+        Recommendations below are based on client behaviour + common
+        causes of ~2-minute WebSocket drops.
+
+1. Observed client protocol (current widget)
+-------------------------------------------
+URL:  ws://incivisme.fgc.cat:8080  (plain WS, not WSS)
+
+Inbound (server → widget):
+  { "alerts": <number>, "notify": <boolean> }
+  { "type": "stop_alerts" }
+
+Outbound (widget → server):
+  { "type": "stop_alerts" }
+  { "type": "ping", "ts": <ms> }     NEW – every ~25s (keepalive)
+  { "type": "sync" }                 NEW – on each successful connect
+  { "type": "pong", "ts": <ms> }     NEW – if server sends ping
+
+2. Root-cause hypothesis (high confidence)
+------------------------------------------
+There is no 120s timeout in the Electron client. Disconnects every
+~2 minutes with no application heartbeat historically match:
+
+  - Reverse proxy / load balancer idle timeout (~120s)
+  - Or a server-side idle close with no ping/pong
+
+Because the old client sent zero traffic while idle, any intermediary
+with a 120s idle timer would close the socket on a fixed cadence.
+Production failing more often than DEV usually means different proxy
+timeouts or an extra LB hop in PROD.
+
+3. Required server-side support (please implement)
+-------------------------------------------------
+A. Prefer answering application ping:
+     receive { "type": "ping" } → send { "type": "pong" }
+
+B. On { "type": "sync" } (or on every new connection), push current
+   pending count so the widget can recover after a gap:
+     { "alerts": <pendingCount>, "notify": <bool> }
+   (Same shape as existing alert broadcasts.)
+
+C. Confirm broadcasts only reach currently connected sockets.
+   Alerts emitted while a widget is disconnected are lost unless
+   the next connect/sync returns the authoritative count (B).
+
+D. Idle / proxy timeouts:
+   - nginx: proxy_read_timeout / proxy_send_timeout ≥ 300s (or disable
+     idle close for the WS location); enable websocket Upgrade headers
+   - AWS ALB etc.: idle timeout > heartbeat interval (25s); recommend ≥ 60–300s
+   - Raise any app-level connection idle timeout above the heartbeat
+
+E. Prefer wss:// behind TLS termination for production.
+
+4. Until server source is provided
+---------------------------------
+The widget now:
+  - Sends ping every 25s (often enough to reset proxy idle timers)
+  - Reconnects with exponential backoff
+  - Requests sync on open
+  - Logs close code / reason / durationMs for RCA from electron-log
+  - Reconnects on OS resume / browser online
+
+Probe notes (2026-07-24 against prod):
+  - With heartbeat: 3 min continuous session, no spontaneous close
+  - Idle 3 min from this network also stayed up (path-dependent)
+  - Server echoes {type:"ping"} and {type:"sync"} without pong/alerts body
+  - Server DOES push {alerts,notify} immediately on connect (used for resync)
+
+If disconnects continue at exactly ~120s AFTER this client ship on the
+client's site, inspect proxy/LB idle timeout (item D) and electron-log
+close events (code/reason/durationMs).
+
+5. Deliverables still needed from client
+---------------------------------------
+See CLIENT_DELIVERABLES.txt in this repository.
