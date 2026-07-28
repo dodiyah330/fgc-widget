@@ -50,3 +50,8 @@ coverage/
 *.local
 tmp/
 temp/
+
+# Large client deliverable packages (keep locally, do not push)
+*.zip
+!dist-deploy/fgc-websocket-patch.zip
+dist-deploy/FGC_Widget_Stabilization_Package_*/

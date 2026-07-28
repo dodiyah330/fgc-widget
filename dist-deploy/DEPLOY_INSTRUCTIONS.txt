@@ -1,0 +1,84 @@
+FGC Widget – Deploy package for validation
+==========================================
+Date: 2026-07-25
+
+This package contains everything needed to deploy and test the WebSocket
+stabilisation work.
+
+CONTENTS
+--------
+1. widget-source/
+   Electron / Vue / Quasar widget source (patched client).
+
+2. server-patch/
+   Symfony files to replace on the production WebSocket server:
+   - src/WebSocketServer.php
+   - src/Command/WebSocketServerCommand.php
+
+3. mac-build/  (optional verification build)
+   - fgc-widget_arm64.dmg
+   - fgc-widget_arm64.pkg
+   NOTE: this local build is signed with an Apple Development certificate and
+   is NOT notarized. Gatekeeper may reject it on other Macs. For operator
+   distribution, rebuild on your release machine with the Informage Developer
+   ID identity and Apple notarization credentials.
+
+4. docs/
+   - FGC_Widget_Before_After_Testing_Report.md  (send to stakeholders)
+   - TESTING_SUMMARY.txt
+   - BACKEND_RECOMMENDATIONS.txt
+   - CLIENT_DELIVERABLES.txt
+
+5. tests/
+   Smoke tests for server and client WebSocket logic.
+
+
+DEPLOY ORDER (required)
+-----------------------
+A. Server (must be first)
+
+   1. On the Symfony host, replace:
+        src/WebSocketServer.php
+        src/Command/WebSocketServerCommand.php
+      with the files from server-patch/.
+
+   2. Restart the WebSocket process:
+        app:websocket-server
+      (use your usual process manager / systemd / supervisor command)
+
+   3. Confirm the process is listening on port 8080.
+
+B. Widget
+
+   Option 1 – rebuild on your release machine (recommended for distribution):
+        cd widget-source
+        npm ci
+        quasar build -m electron
+      Then sign + notarize with your production Apple credentials.
+
+   Option 2 – use mac-build/ only for a quick internal check on a Mac that
+   allows the Development-signed binary (may need: right-click → Open).
+
+
+ACCEPTANCE TEST (short)
+-----------------------
+1. Open the widget. Confirm it is online (not stuck on DESCONECTAT).
+2. Open CMS → Alertes pendents. Widget number must equal the CMS total.
+3. From the FGC Android app, send an alert with description exactly: test
+4. Within ~2 seconds the widget count must increase by 1 and sound/light must fire.
+5. Resolve/manage one pending alert in the CMS. Count decreases; sound must NOT replay.
+6. Turn Wi‑Fi off ~30–60s, then on. Widget reconnects and count matches CMS.
+7. Leave idle 20–30 minutes (ideally 2–4 hours). Confirm no recurring ~2-minute disconnects.
+8. Widget log (macOS):
+     ~/Library/Logs/FGC Widget APP/main.log
+9. Cleanup: in Alertes pendents, delete ONLY alerts whose description contains "test".
+
+
+SUCCESS CRITERIA
+----------------
+- Stable WebSocket connection
+- Reliable automatic reconnect
+- Notifications without multi-second delay
+- No lost notifications
+- Unread counter matches CMS
+- No recurring disconnects during extended run
