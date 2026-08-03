@@ -23,8 +23,6 @@ dist_electron/
 *.exe
 
 # Env / secrets
-.env
-.env.*
 !.env.example
 *.pem
 *.p12
@@ -33,7 +31,6 @@ dist_electron/
 # IDE / OS
 .DS_Store
 .idea/
-.vscode/
 *.swp
 *.swo
 Thumbs.db
@@ -55,3 +52,4 @@ temp/
 *.zip
 !dist-deploy/fgc-websocket-patch.zip
 dist-deploy/FGC_Widget_Stabilization_Package_*/
+config.bat

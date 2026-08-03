@@ -15,7 +15,7 @@
 
 <script>
 import { storeToRefs } from 'pinia'
-import { useMyStore } from 'stores/duration.js'
+import { DURATION_OPTIONS, useMyStore } from 'stores/duration.js'
 
 export default {
   name: 'InlineSelectableDivs',
@@ -32,7 +32,7 @@ export default {
 
     return {
       printValue,
-      values: [0, 1, 3],
+      values: DURATION_OPTIONS,
       duration,
       selectDiv: (value) => store.changeDuration(value),
     }

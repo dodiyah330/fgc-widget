@@ -10,14 +10,14 @@
   "scripts": {
     "lint": "eslint -c ./eslint.config.js \"./src*/**/*.{js,cjs,mjs,vue}\"",
     "format": "prettier --write \"**/*.{js,vue,scss,html,md,json}\" --ignore-path .gitignore",
-    "test": "echo \"No test specified\" && exit 0",
-    "dev": "quasar dev",
-    "dev-electron": "quasar dev -m electron",
-    "build": "quasar build",
-    "build-linux": "quasar build -m electron --target linux",
-    "build-mac": "quasar build -m electron --target mac",
-    "build-mac-v": "DEBUG=electron-builder quasar build -m electron --target mac",
-    "build-mac-vvv": "DEBUG=electron-builder,electron-builder:* quasar build -m electron --target mac",
+    "test": "node tests/duration-persistence.test.mjs",
+    "dev": "node init && quasar dev",
+    "dev-electron": "node init && quasar dev -m electron",
+    "build": "node init && quasar build",
+    "build-linux": "node init && quasar build -m electron --target linux",
+    "build-mac": "node init && quasar build -m electron --target mac",
+    "build-mac-v": "node init && DEBUG=electron-builder quasar build -m electron --target mac",
+    "build-mac-vvv": "node init && DEBUG=electron-builder,electron-builder:* quasar build -m electron --target mac",
     "postinstall": "quasar prepare"
   },
   "dependencies": {
