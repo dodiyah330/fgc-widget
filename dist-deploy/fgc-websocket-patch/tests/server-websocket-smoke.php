@@ -57,13 +57,17 @@ namespace App\Repository {
             $this->repository = $repository;
         }
 
-        public function getSingleScalarResult(): int
+        public function getSingleResult(): array
         {
             if ($this->repository->failQuery) {
                 throw new \RuntimeException('database unavailable');
             }
 
-            return $this->repository->count;
+            return [
+                'cnt' => $this->repository->count,
+                // Doctrine returns NULL for MAX() over an empty set.
+                'maxId' => $this->repository->count === 0 ? null : $this->repository->maxId,
+            ];
         }
     }
 
@@ -77,7 +81,7 @@ namespace App\Repository {
             $this->repository = $repository;
         }
 
-        public function select($select): self
+        public function select(...$select): self
         {
             return $this;
         }
@@ -110,6 +114,7 @@ namespace App\Repository {
     class AlertRepository
     {
         public int $count = 0;
+        public int $maxId = 0;
         public bool $failQuery = false;
         public ?FakeQueryBuilder $lastQueryBuilder = null;
 
@@ -183,10 +188,31 @@ namespace Tests {
         }
     }
 
-    require dirname(__DIR__).'/server-patch/src/WebSocketServer.php';
+    // Works both in the Widget repository (server-patch/src) and inside the
+    // delivered patch package, where the file sits at src/WebSocketServer.php.
+    $serverPaths = [
+        dirname(__DIR__).'/server-patch/src/WebSocketServer.php',
+        dirname(__DIR__).'/src/WebSocketServer.php',
+    ];
+
+    $serverFile = null;
+    foreach ($serverPaths as $candidate) {
+        if (is_file($candidate)) {
+            $serverFile = $candidate;
+            break;
+        }
+    }
+
+    if ($serverFile === null) {
+        fwrite(STDERR, "WebSocketServer.php not found in:\n  ".implode("\n  ", $serverPaths)."\n");
+        exit(1);
+    }
+
+    require $serverFile;
 
     $repository = new AlertRepository();
     $repository->count = 5;
+    $repository->maxId = 100;
     $entityManager = new FakeEntityManager();
     $logger = new FakeLogger();
     $server = new \App\WebSocketServer($repository, $entityManager, $logger);
@@ -197,10 +223,12 @@ namespace Tests {
 
     $server->onOpen($first);
     assertSame([['alerts' => 5, 'notify' => false]], $first->messages, 'Open must send current count.');
+    // The widget total is deliberately not the CMS "Alertes pendents" total: it
+    // excludes alerts already handled by an operator and alerts created in the CMS.
     assertSame(
-        ['a.state = :state', 'a.user != :testUser'],
+        ['a.state = :state', 'a.updatedAt IS NULL', 'a.fromCms IS NULL', 'a.user != :testUser'],
         $repository->lastQueryBuilder->whereClauses,
-        'Count must mirror the CMS pending total (state + test-user exclusion).'
+        'Count must apply the widget business rule (state + updatedAt + fromCms + test user).'
     );
 
     $server->onOpen($second);
@@ -213,6 +241,7 @@ namespace Tests {
 
     $first->messages = [];
     $repository->count = 6;
+    $repository->maxId = 101;
     $server->onMessage($first, '{"type":"sync"}');
     assertSame([['alerts' => 6, 'notify' => false]], $first->messages, 'Sync must return authoritative count privately.');
     assertSame([], $second->messages, 'Sync must not be broadcast.');
@@ -235,6 +264,7 @@ namespace Tests {
     assertSame([], $first->messages, 'Unchanged count must not be rebroadcast.');
 
     $repository->count = 7;
+    $repository->maxId = 102;
     (Loop::$timerCallback)();
     assertSame([['alerts' => 7, 'notify' => true]], $first->messages, 'Count increase must notify.');
     assertSame([['alerts' => 7, 'notify' => true]], $second->messages, 'Increase must reach every widget.');
@@ -245,11 +275,38 @@ namespace Tests {
     (Loop::$timerCallback)();
     assertSame([['alerts' => 3, 'notify' => false]], $first->messages, 'Count decrease must update without notifying.');
 
+    // Regression for the silent-incident report: an operator handling an alert
+    // removes it from the pending set at the same moment a new incident arrives,
+    // so the count is identical across the poll. The arrival must still notify.
+    $first->messages = [];
+    $second->messages = [];
+    $repository->count = 3;
+    $repository->maxId = 103;
+    (Loop::$timerCallback)();
+    assertSame(
+        [['alerts' => 3, 'notify' => true]],
+        $first->messages,
+        'A new incident masked by a simultaneous removal must still notify.'
+    );
+    assertSame(
+        [['alerts' => 3, 'notify' => true]],
+        $second->messages,
+        'The masked arrival must reach every widget.'
+    );
+
+    // Handling an alert without any arrival must stay silent.
+    $first->messages = [];
+    $second->messages = [];
+    $repository->count = 2;
+    (Loop::$timerCallback)();
+    assertSame([['alerts' => 2, 'notify' => false]], $first->messages, 'Removal alone must not notify.');
+
     // Regression: a widget connecting between polls must not consume the pending
     // change and silence the notification for the widgets already connected.
     $first->messages = [];
     $second->messages = [];
     $repository->count = 9;
+    $repository->maxId = 110;
     $third = new FakeConnection(3);
     $server->onOpen($third);
     assertSame([['alerts' => 9, 'notify' => false]], $third->messages, 'New widget must receive the live count.');
@@ -263,6 +320,7 @@ namespace Tests {
     $first->messages = [];
     $second->messages = [];
     $repository->count = 11;
+    $repository->maxId = 111;
     $server->onMessage($third, '{"type":"sync"}');
     assertSame([], $first->messages, 'Sync must not push to other widgets.');
 
@@ -279,9 +337,30 @@ namespace Tests {
     $first->messages = [];
     $third->messages = [];
     $repository->count = 12;
+    $repository->maxId = 112;
     (Loop::$timerCallback)();
     assertSame([['alerts' => 12, 'notify' => true]], $first->messages, 'Broadcast continues after a client disconnects.');
     assertSame([], $third->messages, 'Closed clients must not receive broadcasts.');
+
+    // Emptying the queue makes MAX(id) NULL. The watermark must not fall back to
+    // zero, otherwise the next incident would be compared against a stale baseline.
+    $first->messages = [];
+    $repository->count = 0;
+    (Loop::$timerCallback)();
+    assertSame([['alerts' => 0, 'notify' => false]], $first->messages, 'Emptying the queue must not notify.');
+
+    $first->messages = [];
+    $repository->count = 1;
+    $repository->maxId = 113;
+    (Loop::$timerCallback)();
+    assertSame([['alerts' => 1, 'notify' => true]], $first->messages, 'First incident after an empty queue must notify.');
+
+    // An alert re-entering the set below the watermark (for example an operator
+    // clearing updatedAt) is not a new incident and must stay silent.
+    $first->messages = [];
+    $repository->count = 2;
+    (Loop::$timerCallback)();
+    assertSame([['alerts' => 2, 'notify' => false]], $first->messages, 'A re-entering old alert must not notify.');
 
     echo "WebSocketServer smoke tests passed.\n";
 }

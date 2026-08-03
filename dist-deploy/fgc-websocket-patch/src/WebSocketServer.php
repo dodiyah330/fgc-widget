@@ -15,12 +15,23 @@ class WebSocketServer implements MessageComponentInterface
 {
     private const POLL_INTERVAL_SECONDS = 2;
 
-    /** Excluded from the CMS pending total by AlertRepository::getTotalAlerts(). */
+    /** Excluded from the widget total, as in AlertRepository::getTotalAlerts(). */
     private const TEST_USER = 'prova';
 
     protected SplObjectStorage $clients;
 
     private int $lastCount = -1;
+
+    /**
+     * Highest pending alert id ever observed, used as the arrival signal.
+     *
+     * The count alone cannot detect a new incident: under the widget business
+     * rule an alert leaves the pending set as soon as an operator handles it
+     * (updatedAt), so an arrival and a removal inside the same poll window
+     * cancel out and the count looks unchanged. This watermark only ever moves
+     * forward, so a new alert is still detected when that happens.
+     */
+    private int $lastSeenAlertId = -1;
 
     public function __construct(
         private readonly AlertRepository $alertRepository,
@@ -49,11 +60,12 @@ class WebSocketServer implements MessageComponentInterface
 
         // Always query the authoritative value on connect. The old implementation
         // sent nothing before the first timer and could send a value up to 14s old.
-        // lastCount must NOT be updated here: it is the broadcast baseline shared by
-        // every widget, and overwriting it would suppress the next broadcast for the
+        // The broadcast baselines must NOT be updated here: they are shared by every
+        // widget, and overwriting them would suppress the next broadcast for the
         // widgets that are already connected.
         try {
-            $this->sendAlertCount($conn, $this->getPendingAlertCount(), false);
+            $snapshot = $this->getPendingAlertSnapshot();
+            $this->sendAlertCount($conn, $snapshot['count'], false);
         } catch (Throwable $e) {
             $this->logger->error('[WebSocketServer::onOpen] No se pudo obtener el contador inicial.', [
                 'resource_id'   => $conn->resourceId,
@@ -85,9 +97,10 @@ class WebSocketServer implements MessageComponentInterface
             case 'sync':
                 // A sync request is private to the requesting widget. Broadcasting
                 // it previously made legacy widgets treat it as a new notification.
-                // As in onOpen, the shared broadcast baseline is left untouched.
+                // As in onOpen, the shared broadcast baselines are left untouched.
                 try {
-                    $this->sendAlertCount($from, $this->getPendingAlertCount(), false);
+                    $snapshot = $this->getPendingAlertSnapshot();
+                    $this->sendAlertCount($from, $snapshot['count'], false);
                 } catch (Throwable $e) {
                     $this->logger->error('[WebSocketServer::onMessage] Error sincronizando contador.', [
                         'resource_id'   => $from->resourceId,
@@ -145,7 +158,7 @@ class WebSocketServer implements MessageComponentInterface
     private function broadcastAlerts(): void
     {
         try {
-            $count = $this->getPendingAlertCount();
+            $snapshot = $this->getPendingAlertSnapshot();
         } catch (Throwable $e) {
             // An exception escaping a ReactPHP timer can terminate the process and
             // disconnect every widget. Log it and allow the next cycle to retry.
@@ -155,50 +168,82 @@ class WebSocketServer implements MessageComponentInterface
             return;
         }
 
-        // Solo emitimos si el estado ha cambiado
-        if ($count === $this->lastCount) {
-            return;
-        }
+        $count = $snapshot['count'];
+        $maxId = $snapshot['maxId'];
+
+        $isFirstCycle = $this->lastCount < 0;
+        // A restart must publish the current state without replaying an alarm for
+        // incidents that were already pending.
+        $hasNewAlert = !$isFirstCycle && $maxId > $this->lastSeenAlertId;
+        $countChanged = $count !== $this->lastCount;
 
         $previousCount = $this->lastCount;
         $this->lastCount = $count;
+        if ($maxId > $this->lastSeenAlertId) {
+            $this->lastSeenAlertId = $maxId;
+        }
+
+        // Emit when the number changed or when a new incident arrived. The second
+        // condition is what keeps an arrival visible when a simultaneous removal
+        // leaves the count identical.
+        if (!$countChanged && !$hasNewAlert) {
+            return;
+        }
 
         if ($this->clients->count() === 0) {
             return;
         }
 
-        // Notify only when new pending incidents were added. A decrease must update
-        // the displayed count but must not trigger sound/blinking again.
-        $notify = $previousCount >= 0 && $count > $previousCount;
+        // Notify only for genuinely new incidents. Handling an alert lowers the
+        // count but must not replay sound/blinking.
         $this->broadcastJson([
             'alerts' => $count,
-            'notify' => $notify,
+            'notify' => $hasNewAlert,
         ]);
 
         $this->logger->info('[WebSocketServer::broadcastAlerts] Mensaje emitido.', [
-            'pending_count' => $count,
+            'pending_count'  => $count,
             'previous_count' => $previousCount,
-            'notify'        => $notify,
-            'total_clients' => $this->clients->count(),
+            'max_alert_id'   => $maxId,
+            'notify'         => $hasNewAlert,
+            'masked_arrival' => $hasNewAlert && !$countChanged,
+            'total_clients'  => $this->clients->count(),
         ]);
     }
 
-    private function getPendingAlertCount(): int
+    /**
+     * Pending incidents for the widget, with the highest id in that set.
+     *
+     * This is intentionally NOT the CMS "Alertes pendents" total. The widget shows
+     * only incidents still awaiting an operator:
+     *   - pending state
+     *   - not yet handled by an operator (updatedAt IS NULL)
+     *   - not created manually from the CMS (fromCms IS NULL)
+     *   - excluding the test user
+     * The widget number can therefore legitimately be lower than the CMS total.
+     *
+     * @return array{count: int, maxId: int}
+     */
+    private function getPendingAlertSnapshot(): array
     {
         $this->em->clear();
 
-        // Mirror AlertRepository::getTotalAlerts(), which produces the total shown
-        // in the CMS "Alertes pendents" screen: pending state, excluding the test
-        // user. The previous updatedAt/fromCms exclusions made the widget disagree
-        // with the CMS whenever an alert was edited or created from the CMS.
-        return (int) $this->alertRepository->createQueryBuilder('a')
-            ->select('COUNT(a.id)')
+        $row = $this->alertRepository->createQueryBuilder('a')
+            ->select('COUNT(a.id) AS cnt', 'MAX(a.id) AS maxId')
             ->where('a.state = :state')
+            ->andWhere('a.updatedAt IS NULL')
+            ->andWhere('a.fromCms IS NULL')
             ->andWhere('a.user != :testUser')
             ->setParameter('state', 1)
             ->setParameter('testUser', self::TEST_USER)
             ->getQuery()
-            ->getSingleScalarResult();
+            ->getSingleResult();
+
+        return [
+            'count' => (int) ($row['cnt'] ?? 0),
+            // MAX() is NULL when nothing is pending; 0 keeps the watermark usable.
+            'maxId' => (int) ($row['maxId'] ?? 0),
+        ];
     }
 
     private function sendAlertCount(ConnectionInterface $client, int $count, bool $notify): void

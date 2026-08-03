@@ -1,13 +1,16 @@
 FGC Widget – Confirmed server findings and deployment notes
 ============================================================
-Date: 2026-07-25
+Date: 2026-07-25 (superseded in part; see REVISIONS at the end)
 Endpoint: ws://incivisme.fgc.cat:8080
 Server: ReactPHP SocketServer + Ratchet v0.4.4 (direct, no proxy/LB)
 
 CONFIRMED ROOT CAUSES
 ---------------------
 1. WebSocket count did not match the CMS definition.
-   The total shown in "Alertes pendents" comes from
+   SUPERSEDED on 2026-07-28: the client confirmed the divergence is intended.
+   The widget must NOT mirror "Alertes pendents"; see REVISIONS. Only the
+   'prova' exclusion from this finding was kept.
+   Original finding: the total shown in "Alertes pendents" comes from
    AlertRepository::getTotalAlerts(): state = pending AND user != 'prova'.
    WebSocketServer.php did not exclude 'prova' and additionally excluded
    updatedAt IS NOT NULL and fromCms IS NOT NULL records. Therefore, an edited
@@ -44,7 +47,7 @@ CONFIRMED ROOT CAUSES
 
 WHAT THE PATCH CHANGES
 ----------------------
-- Count query now mirrors the CMS total: state = 1 AND user != 'prova'.
+- Count query excludes the test user (see REVISIONS for the final rule).
 - Every connection receives a fresh authoritative count immediately.
 - onOpen/sync never modify lastCount, so they cannot suppress a broadcast.
 - sync returns a fresh count only to its requester.
@@ -80,3 +83,33 @@ DEPLOYMENT
    "[WS] connection closed" (code/reason/durationMs).
 
 Patch files are under server-patch/ in the Widget repository.
+
+
+REVISIONS
+---------
+2026-07-28 – Pending-count rule restored at the client's request.
+   The widget is intentionally not equal to the CMS "Alertes pendents" total.
+   It counts only: state = 1 AND updatedAt IS NULL AND fromCms IS NULL AND
+   user != 'prova'. The widget number may therefore be lower than the CMS
+   total. Finding 1 above is superseded accordingly.
+
+2026-08-03 – Silent incidents when a removal masks an arrival.
+   Reported: an incident sent from the app at ~23:30 produced no sound, and was
+   only noticed after refreshing the CMS.
+   Cause: under the 2026-07-28 rule an alert leaves the pending set as soon as
+   an operator handles it, so removals are routine. broadcastAlerts() decided
+   everything from the pending count and returned early when that number was
+   unchanged. An operator handling an alert in the same 2-second poll window in
+   which a new incident arrived produced a net-zero change, so no message was
+   sent at all: no sound, no blinking, no count update. The displayed number
+   stayed arithmetically correct, which is why nothing looked wrong.
+   Evidence: in the 2026-07-31 server log operators set updatedAt 29 times in
+   8 hours, in bursts as tight as three changes within six seconds, which is
+   when an arrival is most exposed. In that particular window the closest an
+   arrival came to a removal was 46 seconds, so nothing was lost then - the
+   collision is infrequent rather than constant.
+   Fix: the poll also reads MAX(id) over the pending set and keeps a monotonic
+   watermark. A broadcast is emitted when the count changes OR the watermark
+   advances, and notify is driven by the watermark rather than by the count
+   direction. Handling an alert still updates the number silently.
+   Broadcasts now log max_alert_id and masked_arrival for diagnosis.
